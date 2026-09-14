@@ -2,19 +2,34 @@
 🐄 Bovine SNP Platform
 Pipeline complet de bioinformatique pour puces SNP bovines.
 Application Streamlit mono-fichier — déployable sur Streamlit Cloud.
+
+Version 2.0 — corrections majeures :
+ - Encodage 0/1/2 réel (dosage de l'allèle mineur) pour PED
+ - Génération de démo alignée (gt ↔ ind_df)
+ - Test exact de Hardy-Weinberg (Wigginton et al. 2005)
+ - FST de Nei avec Hs pondéré
+ - LD decay vectorisé (matrice de corrélation)
+ - Manhattan robuste aux chromosomes non numériques
+ - Garde-fous d'alignement dans le filtrage QC
+ - Invalidation automatique des analyses en aval
 """
 
-import streamlit as st
+import warnings
+from collections import Counter
+from datetime import datetime
+from io import BytesIO
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 from plotly.subplots import make_subplots
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.manifold import MDS as SklearnMDS
-from io import StringIO, BytesIO
-from datetime import datetime
+
+warnings.filterwarnings("ignore", category=RuntimeWarning)
 
 # ============================================================
 # CONFIGURATION
@@ -27,112 +42,187 @@ st.set_page_config(
 )
 
 DEFAULT_THRESHOLDS = {
-    "geno": 0.05,   # missingness SNP
-    "mind": 0.05,   # missingness individu
+    "geno": 0.05,     # missingness SNP
+    "mind": 0.05,     # missingness individu
     "maf": 0.05,
     "hwe": 1e-6,
     "het_sd": 3.0,
 }
 
+# Nombre max de SNPs pour le calcul HWE exact (au-delà : approximation chi²)
+HWE_EXACT_MAX_SNP = 20_000
+
+
+# ============================================================
+# UTILITAIRES NUMÉRIQUES
+# ============================================================
+
+def impute_mean(gt: np.ndarray) -> np.ndarray:
+    """Imputation par moyenne de colonne (par SNP). Retourne une copie."""
+    gt2 = gt.astype(np.float32, copy=True)
+    col_mean = np.nanmean(gt2, axis=0)
+    # SNP totalement manquant → moyenne 0 (deviendra informatif nul)
+    col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
+    nan_mask = np.isnan(gt2)
+    if not nan_mask.any():
+        return gt2
+    gt2[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])
+    return gt2
+
+
+def safe_divide(a, b, fill=np.nan):
+    """Division sûre, évite les RuntimeWarning."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = np.true_divide(a, b)
+    r = np.where(np.isfinite(r), r, fill)
+    return r
+
+
 # ============================================================
 # PARSING PED / MAP
 # ============================================================
 
-def parse_map(map_bytes: bytes) -> pd.DataFrame:
-    """Parse un fichier .map (chr, snp_id, cm, bp)."""
-    rows = []
+def parse_map(map_bytes: bytes) -> tuple:
+    """
+    Parse un fichier .map (chr, snp_id, cm, bp).
+    Retourne (DataFrame, nombre de lignes rejetées).
+    """
     text = map_bytes.decode("utf-8", errors="replace")
-    for line in text.strip().split("\n"):
+    rows, rejected = [], 0
+    for i, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line:
+            continue
         parts = line.split()
         if len(parts) < 4:
+            rejected += 1
             continue
         try:
-            bp = int(parts[3])
+            cm = float(parts[2]) if parts[2] not in ("0", ".", "NA") else 0.0
         except ValueError:
-            bp = 0
+            cm = 0.0
+        try:
+            bp = int(float(parts[3]))
+        except (ValueError, TypeError):
+            rejected += 1
+            continue
         rows.append({
             "CHR": str(parts[0]),
             "SNP": parts[1],
-            "CM": float(parts[2]) if parts[2] not in ("0", ".") else 0.0,
+            "CM": cm,
             "BP": bp,
         })
-    return pd.DataFrame(rows)
+    if not rows:
+        raise ValueError("Fichier .map vide ou invalide.")
+    return pd.DataFrame(rows), rejected
 
 
 def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
-    """Parse un fichier .ped et encode les génotypes en dosage 0/1/2."""
-    text = ped_bytes.decode("utf-8", errors="replace")
-    lines = [l for l in text.strip().split("\n") if l.strip()]
+    """
+    Parse un fichier .ped et encode les génotypes en dosage 0/1/2 de
+    l'allèle MINEUR (déterminé par comptage sur l'échantillon).
 
+    Retourne (gt, ind_df, n_rejected).
+    """
+    text = ped_bytes.decode("utf-8", errors="replace")
     fids, iids, geno_rows = [], [], []
-    for line in lines:
+    rejected = 0
+    expected_cols = 6 + 2 * n_snp
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         parts = line.split()
-        if len(parts) < 6 + 2 * n_snp:
+        if len(parts) < expected_cols:
+            rejected += 1
             continue
         fids.append(parts[0])
         iids.append(parts[1])
         geno_rows.append(parts[6:6 + 2 * n_snp])
 
     n_ind = len(iids)
+    if n_ind == 0:
+        raise ValueError(
+            f"Aucun individu valide : toutes les lignes du .ped ont moins de "
+            f"{expected_cols} colonnes."
+        )
+
+    # --- Passe 1 : comptage des allèles par SNP ---
+    allele_counts = [Counter() for _ in range(n_snp)]
+    for row in geno_rows:
+        for j in range(n_snp):
+            a1, a2 = row[2 * j], row[2 * j + 1]
+            if a1 == "0" or a2 == "0":
+                continue
+            c = allele_counts[j]
+            c[a1] += 1
+            c[a2] += 1
+
+    # Détermination de l'allèle mineur (None si monomorphe)
+    minor = [None] * n_snp
+    for j, c in enumerate(allele_counts):
+        if len(c) < 2:
+            continue
+        minor[j] = min(c, key=c.get)
+
+    # --- Passe 2 : dosage 0/1/2 de l'allèle mineur ---
     gt = np.full((n_ind, n_snp), np.nan, dtype=np.float32)
-
     for i, row in enumerate(geno_rows):
-        alleles = np.array(row).reshape(n_snp, 2)
-        a1, a2 = alleles[:, 0], alleles[:, 1]
-        mask = (a1 != "0") & (a2 != "0")
-        for j in np.where(mask)[0]:
-            x, y = a1[j], a2[j]
-            if x == y:
-                gt[i, j] = 0.0
-            else:
-                gt[i, j] = 1.0
-        # Note : pour un dosage 0/1/2 complet il faudrait connaître les allèles
-        # de référence. Ici on utilise 0 = homozygote, 1 = hétérozygote, NaN = manquant.
-        # Pour MAF on utilisera un encodage binaire.
-
-    # Ré-encodage binaire (0/1) pour MAF / FST
-    gt_bin = np.full((n_ind, n_snp), np.nan, dtype=np.float32)
-    for i, row in enumerate(geno_rows):
-        alleles = np.array(row).reshape(n_snp, 2)
-        a1, a2 = alleles[:, 0], alleles[:, 1]
-        mask = (a1 != "0") & (a2 != "0")
-        for j in np.where(mask)[0]:
-            # On code l'allèle minoritaire 1 par convention arbitraire (prévalence)
-            gt_bin[i, j] = 1.0 if a1[j] != a2[j] else 0.0
+        for j in range(n_snp):
+            m = minor[j]
+            if m is None:
+                continue
+            a1, a2 = row[2 * j], row[2 * j + 1]
+            if a1 == "0" or a2 == "0":
+                continue
+            gt[i, j] = (1 if a1 == m else 0) + (1 if a2 == m else 0)
 
     ind_df = pd.DataFrame({"FID": fids, "IID": iids})
-    return gt, gt_bin, ind_df
+    return gt, ind_df, rejected
 
 
 # ============================================================
-# DEMO DATA
+# DONNÉES DE DÉMONSTRATION
 # ============================================================
 
 def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
-                       n_pop: int = 4, seed: int = 42):
-    """Génère un jeu de données synthétique réaliste (4 races bovines)."""
+                       n_pop: int = 4, seed: int = 42) -> tuple:
+    """
+    Génère un jeu synthétique avec structure de populations (Fst modéré).
+    Le nombre d'individus par population est réparti équitablement, le reste
+    est distribué aux premières populations.
+    """
     rng = np.random.default_rng(seed)
-    pop_names = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
-                 "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"][:n_pop]
+
+    pool_names = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
+                  "NBD", "NKA", "PRS", "PSH", "PTP", "SHO", "YBS"]
+    n_pop = max(1, min(n_pop, len(pool_names)))
+    pop_names = pool_names[:n_pop]
+
+    # Répartition : base + 1 pour les premières pops
+    per_pop = n_ind // n_pop
+    remainder = n_ind - per_pop * n_pop
+    counts = [per_pop + (1 if i < remainder else 0) for i in range(n_pop)]
+    n_ind_eff = sum(counts)
 
     p_anc = rng.beta(0.6, 0.6, n_snp)
     drift = 0.15
 
-    gt = np.zeros((n_ind, n_snp), dtype=np.float32)
+    gt = np.zeros((n_ind_eff, n_snp), dtype=np.float32)
     ind_rows = []
-    per_pop = n_ind // n_pop
 
     k = 0
-    for pop in pop_names:
+    for pop, n_i in zip(pop_names, counts):
         p_k = np.clip(p_anc + rng.normal(0, drift, n_snp), 0.02, 0.98)
-        for i in range(per_pop):
+        for i in range(n_i):
             a1 = (rng.random(n_snp) < p_k).astype(np.float32)
             a2 = (rng.random(n_snp) < p_k).astype(np.float32)
             gt[k] = a1 + a2
-            ind_rows.append({"FID": pop, "IID": f"{pop}_{i+1:03d}"})
+            ind_rows.append({"FID": pop, "IID": f"{pop}_{i + 1:03d}"})
             k += 1
 
-    # Missingness 2 %
+    # Missingness ~2 %
     mask = rng.random(gt.shape) < 0.02
     gt[mask] = np.nan
 
@@ -141,13 +231,17 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
         "CHR": rng.integers(1, 30, n_snp).astype(str),
         "SNP": [f"rs{i:07d}" for i in range(n_snp)],
         "CM": 0.0,
-        "BP": np.sort(rng.integers(1, 100_000_000, n_snp)),
+        "BP": rng.integers(1, 100_000_000, n_snp),
     })
+    # Trier par chr puis bp (ordre réaliste)
+    snp_df["_chr_int"] = pd.to_numeric(snp_df["CHR"], errors="coerce").fillna(0).astype(int)
+    snp_df = snp_df.sort_values(["_chr_int", "BP"]).drop(columns="_chr_int").reset_index(drop=True)
+
     return gt, ind_df, snp_df
 
 
 # ============================================================
-# ANALYSES QC
+# QC — MÉTRIQUES
 # ============================================================
 
 def missingness_per_ind(gt: np.ndarray) -> np.ndarray:
@@ -159,109 +253,224 @@ def missingness_per_snp(gt: np.ndarray) -> np.ndarray:
 
 
 def allele_freq(gt: np.ndarray) -> np.ndarray:
-    """Fréquence de l'allèle codé 1 (par SNP)."""
-    with np.errstate(invalid="ignore"):
-        return np.nanmean(gt, axis=0) / 2.0
+    """Fréquence de l'allèle codé '1' (dosage moyen / 2)."""
+    return np.nanmean(gt, axis=0) / 2.0
 
 
 def maf(gt: np.ndarray) -> np.ndarray:
     p = allele_freq(gt)
-    return np.minimum(p, 1 - p)
-
-
-def hwe_pvalues(gt: np.ndarray) -> np.ndarray:
-    """Test exact de Hardy-Weinberg (chi² approché) par SNP."""
-    n_snp = gt.shape[1]
-    pvals = np.full(n_snp, np.nan)
-    for j in range(n_snp):
-        col = gt[:, j]
-        col = col[~np.isnan(col)]
-        n = len(col)
-        if n < 10:
-            continue
-        # Ici col est 0/1/2 (dosage), donc :
-        #   n0 = homozygotes ref, n1 = hétérozygotes, n2 = homozygotes alt
-        # Approx : on reconvertit par fréquence d'allèle
-        p = col.mean() / 2.0
-        if p <= 0 or p >= 1:
-            continue
-        exp_het = 2 * p * (1 - p) * n
-        obs_het = (col == 1).sum()
-        if exp_het < 5:
-            continue
-        chi2 = (obs_het - exp_het) ** 2 / exp_het
-        pvals[j] = 1 - stats.chi2.cdf(chi2, df=1)
-    return pvals
+    return np.minimum(p, 1.0 - p)
 
 
 def heterozygosity(gt: np.ndarray) -> np.ndarray:
-    """Hétérozygotie observée par individu."""
-    het = np.nanmean(gt == 1, axis=1)
-    return het
+    """Hétérozygotie observée par individu (nécessite dosage 0/1/2)."""
+    with np.errstate(invalid="ignore"):
+        return np.nanmean(gt == 1, axis=1)
+
+
+def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
+    """
+    Test exact de Hardy-Weinberg (Wigginton, Cutler, Abecasis 2005).
+    n_hom1 et n_hom2 = comptages des deux homozygotes (ordre indifférent).
+    Retourne la p-value bilatérale. np.nan si non calculable.
+    """
+    n = n_het + n_hom1 + n_hom2
+    if n == 0:
+        return np.nan
+    # Cas triviaux : monomorphe
+    if n_het == 0 and (n_hom1 == 0 or n_hom2 == 0):
+        return 1.0
+
+    rare = 2 * min(n_hom1, n_hom2) + n_het
+    # mid : point de départ de la récursion
+    mid = (rare * (2 * n - rare)) // (2 * n)
+    if mid % 2 != rare % 2:
+        mid += 1
+
+    probs = np.zeros(rare + 1)
+    probs[mid] = 1.0
+    mysum = 1.0
+
+    # Récurrence vers le haut
+    curr_hets = mid
+    curr_homr = (rare - mid) // 2
+    curr_homc = n - curr_hets - curr_homr
+    while curr_hets <= rare - 2:
+        probs[curr_hets + 2] = (
+            probs[curr_hets] * 4 * curr_homr * curr_homc
+            / ((curr_hets + 2) * (curr_hets + 1))
+        )
+        mysum += probs[curr_hets + 2]
+        curr_hets += 2
+        curr_homr -= 1
+        curr_homc -= 1
+
+    # Récurrence vers le bas
+    curr_hets = mid
+    curr_homr = (rare - mid) // 2
+    curr_homc = n - curr_hets - curr_homr
+    while curr_hets >= 2:
+        probs[curr_hets - 2] = (
+            probs[curr_hets] * curr_hets * (curr_hets - 1)
+            / (4 * (curr_homr + 1) * (curr_homc + 1))
+        )
+        mysum += probs[curr_hets - 2]
+        curr_hets -= 2
+        curr_homr += 1
+        curr_homc += 1
+
+    # p-value bilatérale : somme des probas ≤ proba observée
+    p_obs = probs[n_het] if n_het < len(probs) else 0.0
+    p_hwe = probs[probs <= p_obs + 1e-7].sum() / mysum
+    return float(min(p_hwe, 1.0))
+
+
+def hwe_pvalues(gt: np.ndarray, progress_cb=None) -> np.ndarray:
+    """
+    p-values HWE par SNP. Test exact si peu de SNPs, sinon approximation
+    chi² avec correction de continuité (rapide).
+    """
+    n_ind, n_snp = gt.shape
+    pvals = np.full(n_snp, np.nan, dtype=np.float64)
+
+    # Comptages vectorisés 0/1/2
+    nan_mask = np.isnan(gt)
+    n0 = ((gt == 0) & ~nan_mask).sum(axis=0)
+    n1 = ((gt == 1) & ~nan_mask).sum(axis=0)
+    n2 = ((gt == 2) & ~nan_mask).sum(axis=0)
+    n_valid = n0 + n1 + n2
+
+    use_exact = n_snp <= HWE_EXACT_MAX_SNP
+
+    if use_exact:
+        for j in range(n_snp):
+            if n_valid[j] < 5:
+                continue
+            pvals[j] = hwe_exact_p(int(n1[j]), int(n0[j]), int(n2[j]))
+            if progress_cb and (j % 500 == 0):
+                progress_cb(j / n_snp)
+    else:
+        # Approximation chi² avec Yates
+        p = (n1 + 2 * n2) / (2.0 * np.where(n_valid > 0, n_valid, np.nan))
+        with np.errstate(invalid="ignore", divide="ignore"):
+            exp_het = 2.0 * p * (1.0 - p) * n_valid
+            valid = (exp_het >= 5) & np.isfinite(exp_het)
+            chi2 = (np.abs(n1 - exp_het) - 0.5) ** 2 / exp_het
+            pvals[valid] = 1.0 - stats.chi2.cdf(chi2[valid], df=1)
+    return pvals
 
 
 # ============================================================
-# FILTRAGE QC
+# QC — FILTRAGE
 # ============================================================
+
+def _align_shapes(gt, ind_df, snp_df):
+    """Garde-fou : aligne gt / ind_df / snp_df sur leurs dimensions communes."""
+    n_gt, m_gt = gt.shape
+    n_ind = min(n_gt, len(ind_df))
+    n_snp = min(m_gt, len(snp_df))
+    mismatch = (n_gt != len(ind_df)) or (m_gt != len(snp_df))
+    if mismatch:
+        st.warning(
+            f"⚠️ Alignement corrigé — gt={gt.shape}, "
+            f"ind_df={len(ind_df)}, snp_df={len(snp_df)} → "
+            f"utilisation de ({n_ind}, {n_snp})"
+        )
+    gt = gt[:n_ind, :n_snp]
+    ind_df = ind_df.iloc[:n_ind].reset_index(drop=True)
+    snp_df = snp_df.iloc[:n_snp].reset_index(drop=True)
+    return gt, ind_df, snp_df
+
 
 def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
-                     snp_df: pd.DataFrame, params: dict):
+                     snp_df: pd.DataFrame, params: dict,
+                     progress_cb=None) -> tuple:
+    """
+    Pipeline QC séquentiel :
+      1. missingness SNP (--geno)
+      2. missingness individu (--mind)
+      3. MAF
+      4. HWE (test exact)
+      5. hétérozygotie (outliers > N σ)
+    Retourne (gt_filt, ind_filt, snp_filt, stats_dict).
+    """
+    gt, ind_df, snp_df = _align_shapes(gt, ind_df, snp_df)
     n0, m0 = gt.shape
 
     # 1. Missingness SNP
     miss_snp = missingness_per_snp(gt)
     keep_snp = miss_snp <= params["geno"]
+    gt = gt[:, keep_snp]
+    snp_df = snp_df[keep_snp].reset_index(drop=True)
 
     # 2. Missingness individu
-    miss_ind = missingness_per_ind(gt[:, keep_snp])
+    miss_ind = missingness_per_ind(gt)
     keep_ind = miss_ind <= params["mind"]
+    gt = gt[keep_ind]
+    ind_df = ind_df[keep_ind].reset_index(drop=True)
 
-    gt1 = gt[keep_ind][:, keep_snp]
-    ind1 = ind_df[keep_ind].reset_index(drop=True)
-    snp1 = snp_df[keep_snp].reset_index(drop=True)
+    if gt.shape[1] == 0 or gt.shape[0] == 0:
+        raise ValueError(
+            "Tous les SNPs ou individus ont été exclus. "
+            "Assouplissez les seuils de missingness."
+        )
 
     # 3. MAF
-    m = maf(gt1)
-    keep_maf = m >= params["maf"]
-    gt2 = gt1[:, keep_maf]
-    snp2 = snp1[keep_maf].reset_index(drop=True)
+    m = maf(gt)
+    keep_maf = np.isfinite(m) & (m >= params["maf"])
+    gt = gt[:, keep_maf]
+    snp_df = snp_df[keep_maf].reset_index(drop=True)
+
+    if gt.shape[1] == 0:
+        raise ValueError("Tous les SNPs exclus par MAF. Réduisez --maf.")
 
     # 4. HWE
-    pv = hwe_pvalues(gt2)
+    if progress_cb:
+        progress_cb("HWE")
+    pv = hwe_pvalues(gt)
     keep_hwe = np.isnan(pv) | (pv >= params["hwe"])
-    gt3 = gt2[:, keep_hwe]
-    snp3 = snp2[keep_hwe].reset_index(drop=True)
+    gt = gt[:, keep_hwe]
+    snp_df = snp_df[keep_hwe].reset_index(drop=True)
 
-    # 5. Hétérozygotie (outliers > N σ)
-    het = heterozygosity(gt3)
-    z = (het - np.nanmean(het)) / np.nanstd(het)
-    keep_het = np.abs(z) <= params["het_sd"]
-    gt4 = gt3[keep_het]
-    ind4 = ind1[keep_het].reset_index(drop=True)
+    # 5. Hétérozygotie
+    het = heterozygosity(gt)
+    if np.nanstd(het) > 1e-9:
+        z = (het - np.nanmean(het)) / np.nanstd(het)
+        keep_het = np.abs(z) <= params["het_sd"]
+    else:
+        keep_het = np.ones_like(het, dtype=bool)
+    gt = gt[keep_het]
+    ind_df = ind_df[keep_het].reset_index(drop=True)
 
     stats_dict = {
         "n_ind_init": int(n0), "n_snp_init": int(m0),
-        "n_ind_final": int(gt4.shape[0]), "n_snp_final": int(gt4.shape[1]),
-        "excluded_ind": int(n0 - gt4.shape[0]),
-        "excluded_snp": int(m0 - gt4.shape[1]),
+        "n_ind_final": int(gt.shape[0]), "n_snp_final": int(gt.shape[1]),
+        "excluded_ind": int(n0 - gt.shape[0]),
+        "excluded_snp": int(m0 - gt.shape[1]),
     }
-    return gt4, ind4, snp3, stats_dict
+    return gt, ind_df, snp_df, stats_dict
 
 
 # ============================================================
-# DIVERSITÉ / STRUCTURE
+# POPULATION GENETICS
 # ============================================================
 
 def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
-    """FST de Nei par SNP (moyenne sur paires de populations)."""
+    """
+    FST de Nei par SNP (Hs pondéré par les effectifs par population).
+    """
     pops = np.unique(pop_labels)
+    if len(pops) < 2:
+        return np.full(gt.shape[1], np.nan)
+
     n_snp = gt.shape[1]
-    fst = np.full(n_snp, np.nan)
+    fst = np.full(n_snp, np.nan, dtype=np.float64)
+    masks = {p: (pop_labels == p) for p in pops}
+
     for j in range(n_snp):
         p_list, n_list = [], []
         for p in pops:
-            mask = pop_labels == p
-            vals = gt[mask, j]
+            vals = gt[masks[p], j]
             vals = vals[~np.isnan(vals)]
             if len(vals) < 3:
                 continue
@@ -269,89 +478,88 @@ def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
             n_list.append(len(vals))
         if len(p_list) < 2:
             continue
-        p_arr = np.array(p_list)
-        n_arr = np.array(n_list)
+        p_arr = np.asarray(p_list)
+        n_arr = np.asarray(n_list)
         p_bar = np.average(p_arr, weights=n_arr)
-        h_s = np.mean(2 * p_arr * (1 - p_arr))
-        h_t = 2 * p_bar * (1 - p_bar)
+        h_s = np.average(2.0 * p_arr * (1.0 - p_arr), weights=n_arr)
+        h_t = 2.0 * p_bar * (1.0 - p_bar)
         if h_t > 1e-9:
             fst[j] = (h_t - h_s) / h_t
     return fst
 
 
-def impute_mean(gt: np.ndarray) -> np.ndarray:
-    col_mean = np.nanmean(gt, axis=0)
-    inds = np.where(np.isnan(gt))
-    gt2 = gt.copy()
-    gt2[inds] = np.take(col_mean, inds[1])
-    return gt2
-
-
-def pca_analysis(gt: np.ndarray, n_components: int = 10):
+def pca_analysis(gt: np.ndarray, n_components: int = 10) -> tuple:
     X = impute_mean(gt)
     X = X - X.mean(axis=0)
     n_comp = min(n_components, X.shape[0] - 1, X.shape[1])
     pca = PCA(n_components=n_comp)
     scores = pca.fit_transform(X)
-    return scores, pca.explained_variance_ratio_ * 100
+    return scores, pca.explained_variance_ratio_ * 100.0
 
 
-def mds_analysis(gt: np.ndarray, n_components: int = 5):
+def mds_analysis(gt: np.ndarray, n_components: int = 5) -> np.ndarray:
+    """MDS sur distance d'IBS normalisée (adaptée aux données génomiques)."""
     X = impute_mean(gt)
     n = X.shape[0]
-    # Distance euclidienne (matrice de similarité génétique)
+    # Distance de Hamming normalisée par le nombre de SNPs
     D = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
-        D[i] = np.sqrt(((X - X[i]) ** 2).mean(axis=1))
-    mds = SklearnMDS(n_components=n_components, dissimilarity="precomputed",
-                     random_state=42, n_init=1, max_iter=300)
+        D[i] = np.abs(X - X[i]).sum(axis=1) / X.shape[1]
+    mds = SklearnMDS(
+        n_components=n_components,
+        dissimilarity="precomputed",
+        random_state=42,
+        n_init=1,
+        max_iter=300,
+        normalized_stress=False,
+    )
     return mds.fit_transform(D)
 
 
 def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
              max_kb: float = 1000, max_snp: int = 1500,
              seed: int = 42) -> pd.DataFrame:
-    """LD decay (r² vs distance) sur un sous-échantillon de SNPs."""
+    """LD decay vectorisé sur un sous-échantillon de SNPs."""
     n_snp = gt.shape[1]
+    if n_snp < 2:
+        return pd.DataFrame(columns=["dist_kb", "r2"])
+
     rng = np.random.default_rng(seed)
-    if n_snp > max_snp:
-        idx = np.sort(rng.choice(n_snp, max_snp, replace=False))
-    else:
-        idx = np.arange(n_snp)
+    idx = (np.sort(rng.choice(n_snp, max_snp, replace=False))
+           if n_snp > max_snp else np.arange(n_snp))
 
-    gt_sub = gt[:, idx]
-    bp_sub = snp_bp[idx]
+    gt_sub = impute_mean(gt[:, idx])
+    bp_sub = snp_bp[idx].astype(np.float64)
 
-    # Imputation rapide
-    col_mean = np.nanmean(gt_sub, axis=0)
-    inds = np.where(np.isnan(gt_sub))
-    gt_sub[inds] = np.take(col_mean, inds[1])
+    # Standardisation par SNP
+    X = gt_sub - gt_sub.mean(axis=0)
+    std = gt_sub.std(axis=0)
+    std[std < 1e-8] = np.nan
+    X = X / std
 
-    results = []
-    n = len(idx)
-    for ii in range(n):
-        i = ii
-        for jj in range(ii + 1, n):
-            j = jj
-            dist_kb = (bp_sub[j] - bp_sub[i]) / 1000.0
-            if dist_kb > max_kb:
-                break
-            x, y = gt_sub[:, i], gt_sub[:, j]
-            if x.std() < 1e-6 or y.std() < 1e-6:
-                continue
-            r = np.corrcoef(x, y)[0, 1]
-            results.append({"dist_kb": dist_kb, "r2": r ** 2})
-    return pd.DataFrame(results)
+    # Matrice de corrélation (SNPs × SNPs)
+    n = X.shape[0]
+    C = (X.T @ X) / n
+    R2 = C ** 2
+
+    iu, ju = np.triu_indices(len(idx), k=1)
+    dist_kb = (bp_sub[ju] - bp_sub[iu]) / 1000.0
+    mask = (dist_kb > 0) & (dist_kb <= max_kb)
+
+    return pd.DataFrame({
+        "dist_kb": dist_kb[mask],
+        "r2": R2[iu[mask], ju[mask]],
+    })
 
 
 def kinship_matrix(gt: np.ndarray) -> np.ndarray:
     """Matrice de parenté génomique (GRM, approche GCTA simplifiée)."""
     X = impute_mean(gt)
-    p = X.mean(axis=0) / 2.0
-    p = np.clip(p, 1e-3, 1 - 1e-3)
+    p = np.clip(X.mean(axis=0) / 2.0, 1e-3, 1 - 1e-3)
     Z = X - 2 * p
-    denom = 2 * p * (1 - p)
-    G = (Z / np.sqrt(denom)) @ (Z / np.sqrt(denom)).T / X.shape[1]
+    denom = np.sqrt(2 * p * (1 - p))
+    Zn = Z / denom
+    G = (Zn @ Zn.T) / X.shape[1]
     return G
 
 
@@ -362,22 +570,23 @@ def kinship_matrix(gt: np.ndarray) -> np.ndarray:
 def plot_hist(values, title, xlabel, color="#3498db", log_y=False):
     fig = go.Figure()
     fig.add_trace(go.Histogram(x=values, nbinsx=80, marker_color=color))
-    fig.update_layout(title=title, xaxis_title=xlabel, yaxis_title="Fréquence",
-                      height=380, margin=dict(l=40, r=20, t=50, b=40))
+    fig.update_layout(
+        title=title, xaxis_title=xlabel, yaxis_title="Fréquence",
+        height=380, margin=dict(l=40, r=20, t=50, b=40),
+    )
     if log_y:
         fig.update_yaxes(type="log")
     return fig
 
 
 def plot_missingness_dashboard(miss_ind, miss_snp):
-    fig = make_subplots(rows=1, cols=2,
-                        subplot_titles=("Missingness par individu",
-                                        "Missingness par SNP"))
-    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=60,
-                               marker_color="skyblue", name="Individus"),
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=("Missingness par individu", "Missingness par SNP"),
+    )
+    fig.add_trace(go.Histogram(x=miss_ind, nbinsx=60, marker_color="skyblue"),
                   row=1, col=1)
-    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=60,
-                               marker_color="coral", name="SNPs"),
+    fig.add_trace(go.Histogram(x=miss_snp, nbinsx=60, marker_color="coral"),
                   row=1, col=2)
     fig.update_layout(height=400, showlegend=False,
                       margin=dict(l=40, r=20, t=60, b=40))
@@ -389,76 +598,104 @@ def plot_missingness_dashboard(miss_ind, miss_snp):
 
 def plot_pca(scores, var_pct, labels):
     df = pd.DataFrame({
-        "PC1": scores[:, 0], "PC2": scores[:, 1],
-        "Population": labels,
+        "PC1": scores[:, 0], "PC2": scores[:, 1], "Population": labels,
     })
-    fig = px.scatter(df, x="PC1", y="PC2", color="Population",
-                     title=f"PCA — PC1 ({var_pct[0]:.1f}%) vs PC2 ({var_pct[1]:.1f}%)",
+    fig = px.scatter(
+        df, x="PC1", y="PC2", color="Population",
+        title=f"PCA — PC1 ({var_pct[0]:.1f}%) vs PC2 ({var_pct[1]:.1f}%)",
+        height=550,
+    )
+    fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
+    fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
+    return fig
+
+
+def plot_mds(coords, labels):
+    df = pd.DataFrame({
+        "MDS1": coords[:, 0], "MDS2": coords[:, 1], "Population": labels,
+    })
+    fig = px.scatter(df, x="MDS1", y="MDS2", color="Population",
+                     title="MDS (IBS) — Structure des populations",
                      height=550)
     fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
 
 
-def plot_mds(mds_coords, labels):
-    df = pd.DataFrame({
-        "MDS1": mds_coords[:, 0], "MDS2": mds_coords[:, 1],
-        "Population": labels,
-    })
-    fig = px.scatter(df, x="MDS1", y="MDS2", color="Population",
-                     title="MDS — Structure des populations", height=550)
-    fig.update_traces(marker=dict(size=10, line=dict(width=1, color="white")))
-    fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
-    return fig
+def _chr_sort_key(chrom: str):
+    """Clé de tri robuste : numériques < sexuels < autres (alphabétique)."""
+    s = str(chrom).upper()
+    if s.isdigit():
+        return (0, int(s), "")
+    special = {"X": 100, "Y": 101, "MT": 102, "M": 102, "W": 103, "Z": 104}
+    if s in special:
+        return (1, special[s], "")
+    return (2, 0, s)
 
 
-def plot_manhattan(fst, chr_col):
-    df = pd.DataFrame({"FST": fst, "CHR": chr_col}).reset_index()
-    df = df.dropna(subset=["FST"])
-    df["CHR"] = pd.to_numeric(df["CHR"], errors="coerce").fillna(0).astype(int)
-    df = df.sort_values(["CHR", "index"]).reset_index(drop=True)
+def plot_manhattan(fst, chr_col, threshold_q=0.999):
+    df = pd.DataFrame({"FST": np.asarray(fst), "CHR": np.asarray(chr_col)})
+    df = df.dropna(subset=["FST"]).reset_index(drop=True)
+    if df.empty:
+        return None
+
+    # Tri selon chromosomes puis ordre original (position)
+    order = df["CHR"].map(lambda c: _chr_sort_key(c))
+    df["_k0"] = order.map(lambda t: t[0])
+    df["_k1"] = order.map(lambda t: t[1])
+    df["_k2"] = order.map(lambda t: t[2])
+    df = df.sort_values(["_k0", "_k1", "_k2"]).reset_index(drop=True)
 
     cumulative = 0
     ticks, labels = [], []
-    for c in sorted(df["CHR"].unique()):
-        sub = df[df["CHR"] == c]
-        ticks.append(cumulative + len(sub) / 2)
-        labels.append(str(c))
-        cumulative += len(sub)
+    cum_positions = np.zeros(len(df), dtype=int)
+    for chrom in df["CHR"].unique():
+        sub_idx = df.index[df["CHR"] == chrom]
+        start, end = cumulative, cumulative + len(sub_idx)
+        cum_positions[start:end] = np.arange(start, end)
+        ticks.append((start + end) / 2)
+        labels.append(str(chrom))
+        cumulative = end
 
-    df["x"] = np.arange(len(df))
-    df["color"] = df["CHR"].astype(str)
-
+    df["x"] = cum_positions
     fig = go.Figure()
-    for c in sorted(df["CHR"].unique()):
-        sub = df[df["CHR"] == c]
+    for chrom in df["CHR"].unique():
+        sub = df[df["CHR"] == chrom]
+        # Alternance par index pair/impair du chromosome
+        idx_chr = list(df["CHR"].unique()).index(chrom)
+        color = "#2c3e50" if idx_chr % 2 == 0 else "#7f8c8d"
         fig.add_trace(go.Scatter(
             x=sub["x"], y=sub["FST"], mode="markers",
-            marker=dict(size=5, color="#2c3e50" if c % 2 == 0 else "#7f8c8d"),
-            name=f"chr{c}", showlegend=False,
+            marker=dict(size=5, color=color),
+            name=f"chr{chrom}", showlegend=False, hoverinfo="skip",
         ))
 
-    q_upper = np.nanquantile(fst, 0.999)
-    fig.add_hline(y=q_upper, line_dash="dash", line_color="red",
-                  annotation_text=f"Seuil top 0.1% = {q_upper:.4f}")
-    fig.update_layout(title="Manhattan Plot — FST par SNP",
-                      xaxis_title="Chromosomes",
-                      yaxis_title="FST",
-                      height=500,
-                      margin=dict(l=40, r=20, t=60, b=40))
+    q_upper = float(np.nanquantile(fst, threshold_q))
+    fig.add_hline(
+        y=q_upper, line_dash="dash", line_color="red",
+        annotation_text=f"Top {100 * (1 - threshold_q):.1f}% = {q_upper:.4f}",
+        annotation_position="top right",
+    )
+    fig.update_layout(
+        title="Manhattan Plot — FST par SNP",
+        xaxis_title="Chromosome", yaxis_title="FST",
+        height=500, margin=dict(l=40, r=20, t=60, b=40),
+    )
     fig.update_xaxes(tickvals=ticks, ticktext=labels)
     return fig
 
 
-def plot_ld_decay(ld_df, max_kb=1000, bin_kb=20):
-    if ld_df.empty:
+def plot_ld_decay(ld_df, bin_kb=20):
+    if ld_df is None or ld_df.empty:
         return None
     ld_df = ld_df.copy()
     ld_df["bin"] = (ld_df["dist_kb"] // bin_kb) * bin_kb
     agg = ld_df.groupby("bin")["r2"].mean().reset_index()
-    fig = px.line(agg, x="bin", y="r2",
-                  labels={"bin": "Distance (kb)", "r2": "r² moyen"},
-                  title="Déséquilibre de liaison (LD decay)", height=450)
+    fig = px.line(
+        agg, x="bin", y="r2",
+        labels={"bin": "Distance (kb)", "r2": "r² moyen"},
+        title="Déséquilibre de liaison (LD decay)", height=450,
+    )
     fig.update_traces(line=dict(color="royalblue", width=3))
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
@@ -466,10 +703,10 @@ def plot_ld_decay(ld_df, max_kb=1000, bin_kb=20):
 
 def plot_kinship_heatmap(G, labels):
     df = pd.DataFrame(G, index=labels, columns=labels)
-    fig = px.imshow(df, color_continuous_scale="RdBu_r",
-                    zmin=-0.3, zmax=0.5,
-                    title="Matrice de parenté (GRM)", height=650,
-                    aspect="auto")
+    fig = px.imshow(
+        df, color_continuous_scale="RdBu_r", zmin=-0.3, zmax=0.5,
+        title="Matrice de parenté (GRM)", height=650, aspect="auto",
+    )
     fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
 
@@ -478,14 +715,23 @@ def plot_kinship_heatmap(G, labels):
 # RAPPORT HTML
 # ============================================================
 
-def build_report_html(state: dict, config: dict, stats: dict,
-                     fig_pca=None, fig_mds=None, fig_manhattan=None):
-    fig_pca_html = fig_pca.to_html(full_html=False, include_plotlyjs="cdn") if fig_pca else "<p>Non disponible</p>"
-    fig_mds_html = fig_mds.to_html(full_html=False, include_plotlyjs=False) if fig_mds else ""
-    fig_manhattan_html = fig_manhattan.to_html(full_html=False, include_plotlyjs=False) if fig_manhattan else ""
+def build_report_html(config, stats, figures=None):
+    figures = figures or {}
+    first = True
+    fig_blocks = []
+    for title, fig in figures.items():
+        if fig is None:
+            continue
+        html = fig.to_html(
+            full_html=False,
+            include_plotlyjs="cdn" if first else False,
+        )
+        first = False
+        fig_blocks.append(f"<h2>{title}</h2>{html}")
 
-    return f"""
-<!DOCTYPE html>
+    figs_html = "\n".join(fig_blocks) if fig_blocks else "<p>Aucune figure.</p>"
+
+    return f"""<!DOCTYPE html>
 <html lang="fr">
 <head>
 <meta charset="UTF-8">
@@ -502,7 +748,8 @@ def build_report_html(state: dict, config: dict, stats: dict,
 </head>
 <body>
 <h1>🐄 Rapport Bovine SNP Platform</h1>
-<p><b>Projet :</b> {config['project_name']} — <b>Date :</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
+<p><b>Projet :</b> {config.get('project_name', 'N/A')} — 
+   <b>Date :</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 
 <div class="summary">
 <h2>Résumé exécutif</h2>
@@ -514,16 +761,11 @@ def build_report_html(state: dict, config: dict, stats: dict,
 </ul>
 </div>
 
-<h2>Analyses de structure</h2>
-{fig_pca_html}
-{fig_mds_html}
-
-<h2>Signatures de sélection (FST)</h2>
-{fig_manhattan_html}
+{figs_html}
 
 <hr>
 <p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform.
+Rapport généré automatiquement par Bovine SNP Platform v2.0.
 </p>
 </body>
 </html>
@@ -531,90 +773,139 @@ Rapport généré automatiquement par Bovine SNP Platform.
 
 
 # ============================================================
-# INTERFACE STREAMLIT
+# STREAMLIT — ÉTAT
 # ============================================================
 
+_STATE_KEYS = [
+    "gt", "ind_df", "snp_df",
+    "gt_filt", "ind_filt", "snp_filt", "qc_stats",
+    "pca_scores", "pca_var", "mds_coords", "kinship",
+    "ld_df", "fst",
+    "run_requested",
+]
+
+
 def init_state():
-    for k in ["gt", "gt_bin", "ind_df", "snp_df",
-              "gt_filt", "ind_filt", "snp_filt", "qc_stats",
-              "fst", "pca_scores", "pca_var", "mds_coords",
-              "ld_df", "kinship", "results"]:
+    for k in _STATE_KEYS:
         if k not in st.session_state:
             st.session_state[k] = None
 
 
+def invalidate_downstream():
+    """À appeler après (re)exécution du QC."""
+    for k in ["pca_scores", "pca_var", "mds_coords", "kinship",
+              "ld_df", "fst"]:
+        st.session_state[k] = None
+
+
+def has_data() -> bool:
+    return st.session_state.gt is not None
+
+
+def has_qc() -> bool:
+    return st.session_state.gt_filt is not None
+
+
+# ============================================================
+# STREAMLIT — INTERFACE
+# ============================================================
+
 def main():
     init_state()
-    st.title("🐄 Bovine SNP Platform")
-    st.caption("Pipeline complet de bioinformatique pour puces SNP bovines — "
-               "100 % Python, déployable sur Streamlit Cloud.")
 
-    # -------------------- SIDEBAR --------------------
+    st.title("🐄 Bovine SNP Platform")
+    st.caption(
+        "Pipeline complet de bioinformatique pour puces SNP bovines — "
+        "100 % Python, déployable sur Streamlit Cloud."
+    )
+
+    # ---------------- SIDEBAR ----------------
     with st.sidebar:
         st.header("📁 Données")
-
         mode = st.radio("Source :", ["Demo", "Upload PED/MAP"], index=0)
 
         if mode == "Demo":
-            if st.button("🎲 Générer un jeu de démonstration", use_container_width=True):
-                with st.spinner("Génération des données synthétiques (4 races, 150 ind, 800 SNPs)..."):
-                    gt, ind_df, snp_df = generate_demo_data(150, 800, 4)
-                    gt_bin = (gt > 0).astype(np.float32)
-                    gt_bin[np.isnan(gt)] = np.nan
+            col1, col2 = st.columns(2)
+            n_ind = col1.number_input("Individus", 20, 1000, 150, 10)
+            n_snp = col2.number_input("SNPs", 100, 10000, 800, 100)
+            n_pop = st.slider("Populations", 2, 10, 4)
+            if st.button("🎲 Générer le jeu de démo", use_container_width=True):
+                with st.spinner("Génération des données synthétiques..."):
+                    gt, ind_df, snp_df = generate_demo_data(
+                        int(n_ind), int(n_snp), int(n_pop)
+                    )
                     st.session_state.gt = gt
-                    st.session_state.gt_bin = gt_bin
                     st.session_state.ind_df = ind_df
                     st.session_state.snp_df = snp_df
-                    st.session_state.gt_filt = None  # reset
-                st.success("Données de démonstration chargées !")
+                    st.session_state.gt_filt = None
+                    invalidate_downstream()
+                st.success(
+                    f"✅ {gt.shape[0]} individus × {gt.shape[1]} SNPs "
+                    f"({n_pop} populations)"
+                )
         else:
             ped_file = st.file_uploader("Fichier .ped", type=["ped", "txt"])
             map_file = st.file_uploader("Fichier .map", type=["map", "txt"])
             if ped_file and map_file:
                 if st.button("📥 Charger les fichiers", use_container_width=True):
-                    with st.spinner("Parsing..."):
-                        map_df = parse_map(map_file.read())
-                        gt, gt_bin, ind_df = parse_ped(ped_file.read(), len(map_df))
+                    try:
+                        with st.spinner("Parsing du .map..."):
+                            map_df, rej_map = parse_map(map_file.read())
+                        with st.spinner("Parsing du .ped (2 passes)..."):
+                            gt, ind_df, rej_ped = parse_ped(
+                                ped_file.read(), len(map_df)
+                            )
                         st.session_state.gt = gt
-                        st.session_state.gt_bin = gt_bin
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
                         st.session_state.gt_filt = None
-                    st.success(f"Chargés : {gt.shape[0]} individus × {gt.shape[1]} SNPs")
+                        invalidate_downstream()
+                        msg = (f"✅ {gt.shape[0]} individus × "
+                               f"{gt.shape[1]} SNPs chargés")
+                        if rej_map or rej_ped:
+                            msg += (f" — ⚠️ lignes rejetées : "
+                                    f"{rej_map} (map), {rej_ped} (ped)")
+                        st.success(msg)
+                    except Exception as e:
+                        st.error(f"❌ Erreur de parsing : {e}")
 
         st.divider()
         st.header("⚙️ Seuils QC")
-        geno = st.slider("Missingness SNP (--geno)", 0.0, 0.5, 0.05, 0.01)
-        mind = st.slider("Missingness individu (--mind)", 0.0, 0.5, 0.05, 0.01)
-        maf_thr = st.slider("MAF minimal", 0.0, 0.5, 0.05, 0.01)
+        geno = st.slider("Missingness SNP (--geno)", 0.0, 0.5,
+                         DEFAULT_THRESHOLDS["geno"], 0.01)
+        mind = st.slider("Missingness individu (--mind)", 0.0, 0.5,
+                         DEFAULT_THRESHOLDS["mind"], 0.01)
+        maf_thr = st.slider("MAF minimal", 0.0, 0.5,
+                            DEFAULT_THRESHOLDS["maf"], 0.01)
         hwe_thr = st.number_input("HWE p-value (exclure < )",
-                                  value=1e-6, format="%.0e")
-        het_sd = st.slider("Écart-type hétérozygotie", 1.0, 5.0, 3.0, 0.1)
+                                  value=DEFAULT_THRESHOLDS["hwe"],
+                                  format="%.0e")
+        het_sd = st.slider("Écart-type hétérozygotie",
+                           1.0, 5.0, DEFAULT_THRESHOLDS["het_sd"], 0.1)
 
         st.divider()
-        if st.button("🚀 Lancer le pipeline", type="primary",
+        if st.button("🚀 Lancer le pipeline complet", type="primary",
                      use_container_width=True):
-            if st.session_state.gt is None:
+            if not has_data():
                 st.error("Chargez ou générez d'abord des données.")
             else:
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("V1.0 — Codé en Python pur. Aucune installation de "
-                   "PLINK/ADMIXTURE/SNeP requise.")
+        st.caption("v2.0 — Python pur. Aucune dépendance PLINK/ADMIXTURE/SNeP.")
 
-    # -------------------- MAIN --------------------
-    if st.session_state.gt is None:
-        st.info("👉 **Pour démarrer** : cliquez sur *Générer un jeu de démonstration* "
+    # ---------------- MAIN ----------------
+    if not has_data():
+        st.info("👉 **Pour démarrer** : cliquez sur *Générer le jeu de démo* "
                 "dans la barre latérale, ou importez un `.ped` + `.map`.")
         st.markdown("""
         ### Ce que fait cette plateforme
-        - **QC** : missingness, MAF, Hardy-Weinberg, hétérozygotie, filtrage automatique
-        - **Diversité** : FST par SNP, hétérozygotie par race
-        - **Structure** : PCA, MDS, matrice de parenté (GRM)
-        - **Démographie** : déséquilibre de liaison (LD decay)
+        - **QC** : missingness, MAF, HWE exact, hétérozygotie, filtrage auto
+        - **Diversité** : FST par SNP (Nei pondéré), hétérozygotie par race
+        - **Structure** : PCA, MDS (IBS), matrice de parenté (GRM)
+        - **Démographie** : déséquilibre de liaison (LD decay vectorisé)
         - **Sélection** : Manhattan plot des outliers FST
-        - **Rapport** : HTML téléchargeable
+        - **Rapport** : HTML téléchargeable avec figures Plotly
         """)
         return
 
@@ -625,7 +916,7 @@ def main():
     tabs = st.tabs(["🏠 Aperçu", "🧹 QC", "🧬 Structure",
                     "📈 Démographie", "🔍 Sélection", "📄 Rapport"])
 
-    # ---- TAB 1 : Aperçu ----
+    # ---------- TAB 1 : Aperçu ----------
     with tabs[0]:
         c1, c2, c3 = st.columns(3)
         c1.metric("Individus", gt.shape[0])
@@ -634,24 +925,31 @@ def main():
 
         st.subheader("Individus")
         st.dataframe(ind_df.head(20), use_container_width=True)
-        st.subheader("Carte des SNPs (5 premières lignes)")
+        st.subheader("Carte des SNPs")
         st.dataframe(snp_df.head(5), use_container_width=True)
 
-    # ---- TAB 2 : QC ----
+    # ---------- TAB 2 : QC ----------
     with tabs[1]:
         st.subheader("Contrôle qualité")
         if st.button("▶ Lancer le QC", use_container_width=True):
-            with st.spinner("Calcul des métriques QC..."):
-                gt_bin = st.session_state.gt_bin
-                gt_filt, ind_filt, snp_filt, qc_stats = apply_qc_filters(
-                    gt_bin, ind_df, snp_df,
-                    {"geno": geno, "mind": mind, "maf": maf_thr,
-                     "hwe": hwe_thr, "het_sd": het_sd}
-                )
-                st.session_state.gt_filt = gt_filt
-                st.session_state.ind_filt = ind_filt
-                st.session_state.snp_filt = snp_filt
-                st.session_state.qc_stats = qc_stats
+            try:
+                with st.spinner("Filtrage QC en cours..."):
+                    params = {"geno": geno, "mind": mind, "maf": maf_thr,
+                              "hwe": hwe_thr, "het_sd": het_sd}
+                    gt_f, ind_f, snp_f, qc_stats = apply_qc_filters(
+                        st.session_state.gt,
+                        st.session_state.ind_df,
+                        st.session_state.snp_df,
+                        params,
+                    )
+                    st.session_state.gt_filt = gt_f
+                    st.session_state.ind_filt = ind_f
+                    st.session_state.snp_filt = snp_f
+                    st.session_state.qc_stats = qc_stats
+                    invalidate_downstream()
+                st.success("✅ QC terminé.")
+            except Exception as e:
+                st.error(f"❌ Erreur QC : {e}")
 
         if st.session_state.qc_stats:
             s = st.session_state.qc_stats
@@ -663,193 +961,236 @@ def main():
             c3.metric("Individus exclus", s["excluded_ind"])
             c4.metric("SNPs exclus", s["excluded_snp"])
 
-            gt_bin = st.session_state.gt_bin
-            miss_ind = missingness_per_ind(gt_bin)
-            miss_snp = missingness_per_snp(gt_bin)
+            gt_full = st.session_state.gt
+            miss_ind = missingness_per_ind(gt_full)
+            miss_snp = missingness_per_snp(gt_full)
             st.plotly_chart(plot_missingness_dashboard(miss_ind, miss_snp),
                             use_container_width=True)
 
             c1, c2 = st.columns(2)
             with c1:
                 st.plotly_chart(
-                    plot_hist(maf(gt_bin), "Spectre MAF", "MAF", "#2ecc71"),
-                    use_container_width=True)
+                    plot_hist(maf(gt_full), "Spectre MAF", "MAF", "#2ecc71"),
+                    use_container_width=True,
+                )
             with c2:
-                het = heterozygosity(gt_bin)
+                het = heterozygosity(gt_full)
                 st.plotly_chart(
-                    plot_hist(het, "Hétérozygotie observée", "HET",
-                              "#9b59b6"),
-                    use_container_width=True)
+                    plot_hist(het, "Hétérozygotie observée", "HET", "#9b59b6"),
+                    use_container_width=True,
+                )
 
-            pv = hwe_pvalues(gt_bin)
-            pv_plot = pv[~np.isnan(pv)]
-            if len(pv_plot) > 0:
-                st.plotly_chart(
-                    plot_hist(pv_plot, "Distribution des p-values HWE",
-                              "p-value", "salmon"),
-                    use_container_width=True)
+            with st.expander("Distribution des p-values HWE (post-filtrage)"):
+                pv = hwe_pvalues(st.session_state.gt_filt)
+                pv_ok = pv[np.isfinite(pv)]
+                if len(pv_ok) > 0:
+                    st.plotly_chart(
+                        plot_hist(pv_ok, "p-values HWE (exact)",
+                                  "p-value", "salmon"),
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Aucune p-value HWE calculable.")
         else:
             st.info("Cliquez sur **Lancer le QC** pour démarrer l'analyse.")
 
-    # ---- TAB 3 : Structure ----
+    # ---------- TAB 3 : Structure ----------
     with tabs[2]:
         st.subheader("Structure des populations")
-        if st.session_state.gt_filt is None:
-            st.warning("Lancez d'abord le QC.")
+        if not has_qc():
+            st.warning("⚠️ Lancez d'abord le QC (onglet 🧹).")
         else:
             if st.button("▶ Calculer PCA + MDS + GRM", use_container_width=True):
-                with st.spinner("Calcul de la PCA..."):
-                    scores, var = pca_analysis(st.session_state.gt_filt, 10)
-                    st.session_state.pca_scores = scores
-                    st.session_state.pca_var = var
-                with st.spinner("Calcul du MDS..."):
-                    mds = mds_analysis(st.session_state.gt_filt, 5)
-                    st.session_state.mds_coords = mds
-                with st.spinner("Calcul de la matrice de parenté..."):
-                    G = kinship_matrix(st.session_state.gt_filt)
-                    st.session_state.kinship = G
-                st.success("Analyses de structure terminées.")
+                try:
+                    with st.spinner("PCA..."):
+                        scores, var = pca_analysis(st.session_state.gt_filt, 10)
+                        st.session_state.pca_scores = scores
+                        st.session_state.pca_var = var
+                    with st.spinner("MDS (IBS)..."):
+                        st.session_state.mds_coords = mds_analysis(
+                            st.session_state.gt_filt, 5)
+                    with st.spinner("Matrice de parenté (GRM)..."):
+                        st.session_state.kinship = kinship_matrix(
+                            st.session_state.gt_filt)
+                    st.success("✅ Analyses de structure terminées.")
+                except Exception as e:
+                    st.error(f"❌ Erreur : {e}")
 
-            if st.session_state.pca_scores is not None:
-                labels = st.session_state.ind_filt["FID"].values
+            labels = (st.session_state.ind_filt["FID"].values
+                      if has_qc() else None)
+
+            if st.session_state.pca_scores is not None and labels is not None:
                 st.plotly_chart(
                     plot_pca(st.session_state.pca_scores,
                              st.session_state.pca_var, labels),
-                    use_container_width=True)
+                    use_container_width=True,
+                )
 
-            if st.session_state.mds_coords is not None:
-                labels = st.session_state.ind_filt["FID"].values
+            if st.session_state.mds_coords is not None and labels is not None:
                 st.plotly_chart(
                     plot_mds(st.session_state.mds_coords, labels),
-                    use_container_width=True)
+                    use_container_width=True,
+                )
 
-            if st.session_state.kinship is not None:
-                labels = st.session_state.ind_filt["FID"].values
+            if st.session_state.kinship is not None and labels is not None:
                 st.plotly_chart(
                     plot_kinship_heatmap(st.session_state.kinship, labels),
-                    use_container_width=True)
+                    use_container_width=True,
+                )
 
-    # ---- TAB 4 : Démographie ----
+    # ---------- TAB 4 : Démographie ----------
     with tabs[3]:
         st.subheader("Démographie — LD decay")
-        if st.session_state.gt_filt is None:
-            st.warning("Lancez d'abord le QC.")
+        if not has_qc():
+            st.warning("⚠️ Lancez d'abord le QC (onglet 🧹).")
         else:
+            c1, c2 = st.columns(2)
+            max_kb = c1.slider("Distance max (kb)", 100, 5000, 1000, 100)
+            max_snp = c2.slider("SNPs max", 200, 5000, 1200, 100)
+
             if st.button("▶ Calculer le LD decay", use_container_width=True):
-                with st.spinner("Calcul du LD decay (sous-échantillon)..."):
-                    ld_df = ld_decay(
-                        st.session_state.gt_filt.copy(),
-                        st.session_state.snp_filt["BP"].values,
-                        max_kb=1000, max_snp=1200)
-                    st.session_state.ld_df = ld_df
-                st.success(f"LD calculé sur {len(ld_df)} paires de SNPs.")
+                try:
+                    with st.spinner("Calcul du LD decay (vectorisé)..."):
+                        ld_df = ld_decay(
+                            st.session_state.gt_filt,
+                            st.session_state.snp_filt["BP"].values,
+                            max_kb=float(max_kb),
+                            max_snp=int(max_snp),
+                        )
+                        st.session_state.ld_df = ld_df
+                    st.success(f"✅ {len(ld_df):,} paires de SNPs calculées.")
+                except Exception as e:
+                    st.error(f"❌ Erreur : {e}")
 
             if st.session_state.ld_df is not None and not st.session_state.ld_df.empty:
                 fig_ld = plot_ld_decay(st.session_state.ld_df)
                 if fig_ld:
                     st.plotly_chart(fig_ld, use_container_width=True)
-                with st.expander("Voir les données brutes"):
-                    st.dataframe(st.session_state.ld_df.head(100))
+                with st.expander("Voir les données brutes (100 premières)"):
+                    st.dataframe(st.session_state.ld_df.head(100),
+                                 use_container_width=True)
 
-    # ---- TAB 5 : Sélection ----
+    # ---------- TAB 5 : Sélection ----------
     with tabs[4]:
         st.subheader("Signatures de sélection (FST)")
-        if st.session_state.gt_filt is None:
-            st.warning("Lancez d'abord le QC.")
+        if not has_qc():
+            st.warning("⚠️ Lancez d'abord le QC (onglet 🧹).")
         else:
+            threshold_q = st.slider("Quantile pour les outliers",
+                                    0.95, 0.9999, 0.999, 0.0001,
+                                    format="%.4f")
             if st.button("▶ Calculer FST + Manhattan", use_container_width=True):
-                with st.spinner("Calcul du FST par SNP..."):
-                    fst = fst_per_snp(
-                        st.session_state.gt_filt,
-                        st.session_state.ind_filt["FID"].values)
-                    st.session_state.fst = fst
-                st.success("FST calculé.")
+                try:
+                    with st.spinner("Calcul du FST par SNP..."):
+                        fst = fst_per_snp(
+                            st.session_state.gt_filt,
+                            st.session_state.ind_filt["FID"].values,
+                        )
+                        st.session_state.fst = fst
+                    st.success("✅ FST calculé.")
+                except Exception as e:
+                    st.error(f"❌ Erreur : {e}")
 
             if st.session_state.fst is not None:
-                fst_clean = st.session_state.fst[~np.isnan(st.session_state.fst)]
-                c1, c2, c3 = st.columns(3)
-                c1.metric("FST moyen", f"{fst_clean.mean():.4f}")
-                c2.metric("FST médian", f"{np.median(fst_clean):.4f}")
-                c3.metric("Seuil top 0.1%", f"{np.quantile(fst_clean, 0.999):.4f}")
+                fst_clean = st.session_state.fst[np.isfinite(st.session_state.fst)]
+                if len(fst_clean) == 0:
+                    st.warning("Aucun FST valide — vérifiez le nombre de populations.")
+                else:
+                    c1, c2, c3 = st.columns(3)
+                    c1.metric("FST moyen", f"{fst_clean.mean():.4f}")
+                    c2.metric("FST médian", f"{np.median(fst_clean):.4f}")
+                    c3.metric("Top outliers",
+                              f"{np.quantile(fst_clean, threshold_q):.4f}")
 
-                fig = plot_manhattan(
-                    st.session_state.fst,
-                    st.session_state.snp_filt["CHR"].values)
-                st.plotly_chart(fig, use_container_width=True)
+                    fig = plot_manhattan(
+                        st.session_state.fst,
+                        st.session_state.snp_filt["CHR"].values,
+                        threshold_q=threshold_q,
+                    )
+                    if fig is not None:
+                        st.plotly_chart(fig, use_container_width=True)
 
-                # Liste des outliers
-                q_upper = np.nanquantile(st.session_state.fst, 0.999)
-                outliers = st.session_state.snp_filt[
-                    st.session_state.fst >= q_upper].copy()
-                outliers["FST"] = st.session_state.fst[
-                    st.session_state.fst >= q_upper]
-                st.subheader(f"SNPs outliers ({len(outliers)})")
-                st.dataframe(outliers, use_container_width=True)
+                    q_upper = float(np.nanquantile(st.session_state.fst,
+                                                   threshold_q))
+                    mask = np.isfinite(st.session_state.fst) & (
+                        st.session_state.fst >= q_upper)
+                    outliers = st.session_state.snp_filt[mask].copy()
+                    outliers["FST"] = st.session_state.fst[mask]
+                    outliers = outliers.sort_values("FST", ascending=False)
+                    st.subheader(f"SNPs outliers ({len(outliers)})")
+                    st.dataframe(outliers, use_container_width=True)
 
-    # ---- TAB 6 : Rapport ----
+    # ---------- TAB 6 : Rapport ----------
     with tabs[5]:
         st.subheader("Génération du rapport")
         if st.session_state.qc_stats is None:
-            st.warning("Lancez au moins le QC pour générer un rapport.")
+            st.warning("⚠️ Lancez au moins le QC pour générer un rapport.")
         else:
+            project_name = st.text_input("Nom du projet", "Cattle_Project")
             if st.button("📄 Générer le rapport HTML", use_container_width=True):
-                fig_pca = None
+                figures = {}
                 if st.session_state.pca_scores is not None:
-                    fig_pca = plot_pca(
+                    figures["PCA"] = plot_pca(
                         st.session_state.pca_scores,
                         st.session_state.pca_var,
-                        st.session_state.ind_filt["FID"].values)
-                fig_mds = None
+                        st.session_state.ind_filt["FID"].values,
+                    )
                 if st.session_state.mds_coords is not None:
-                    fig_mds = plot_mds(
+                    figures["MDS (IBS)"] = plot_mds(
                         st.session_state.mds_coords,
-                        st.session_state.ind_filt["FID"].values)
-                fig_man = None
+                        st.session_state.ind_filt["FID"].values,
+                    )
                 if st.session_state.fst is not None:
-                    fig_man = plot_manhattan(
+                    figures["Manhattan FST"] = plot_manhattan(
                         st.session_state.fst,
-                        st.session_state.snp_filt["CHR"].values)
+                        st.session_state.snp_filt["CHR"].values,
+                    )
 
                 html = build_report_html(
-                    state={}, config={"project_name": "Cattle_Project"},
+                    config={"project_name": project_name},
                     stats=st.session_state.qc_stats,
-                    fig_pca=fig_pca, fig_mds=fig_mds, fig_manhattan=fig_man)
-
+                    figures=figures,
+                )
                 st.download_button(
                     label="⬇ Télécharger le rapport HTML",
                     data=html.encode("utf-8"),
                     file_name=f"rapport_bovine_{datetime.now():%Y%m%d_%H%M}.html",
                     mime="text/html",
-                    use_container_width=True)
-                st.success("Rapport prêt.")
-                with st.expander("Prévisualisation du rapport"):
-                    st.components.v1.html(html, height=600, scrolling=True)
+                    use_container_width=True,
+                )
+                st.success("✅ Rapport prêt.")
+                with st.expander("Prévisualisation"):
+                    st.components.v1.html(html, height=700, scrolling=True)
 
-    # ---- Exécution pipeline complet ----
+    # ---------- PIPELINE COMPLET ----------
     if st.session_state.get("run_requested"):
-        st.session_state["run_requested"] = False
-        with st.spinner("Exécution du pipeline complet..."):
-            gt_bin = st.session_state.gt_bin
-            gt_filt, ind_filt, snp_filt, qc_stats = apply_qc_filters(
-                gt_bin, ind_df, snp_df,
-                {"geno": geno, "mind": mind, "maf": maf_thr,
-                 "hwe": hwe_thr, "het_sd": het_sd})
-            st.session_state.gt_filt = gt_filt
-            st.session_state.ind_filt = ind_filt
-            st.session_state.snp_filt = snp_filt
-            st.session_state.qc_stats = qc_stats
+        st.session_state.run_requested = False
+        try:
+            with st.spinner("Exécution du pipeline complet..."):
+                params = {"geno": geno, "mind": mind, "maf": maf_thr,
+                          "hwe": hwe_thr, "het_sd": het_sd}
+                gt_f, ind_f, snp_f, qc_stats = apply_qc_filters(
+                    st.session_state.gt,
+                    st.session_state.ind_df,
+                    st.session_state.snp_df,
+                    params,
+                )
+                st.session_state.gt_filt = gt_f
+                st.session_state.ind_filt = ind_f
+                st.session_state.snp_filt = snp_f
+                st.session_state.qc_stats = qc_stats
+                invalidate_downstream()
 
-            scores, var = pca_analysis(gt_filt, 10)
-            st.session_state.pca_scores = scores
-            st.session_state.pca_var = var
-
-            st.session_state.mds_coords = mds_analysis(gt_filt, 5)
-            st.session_state.kinship = kinship_matrix(gt_filt)
-            st.session_state.ld_df = ld_decay(
-                gt_filt.copy(), snp_filt["BP"].values,
-                max_kb=1000, max_snp=1000)
-            st.session_state.fst = fst_per_snp(gt_filt, ind_filt["FID"].values)
-        st.success("Pipeline terminé ! Consultez les onglets.")
+                st.session_state.pca_scores, st.session_state.pca_var = \
+                    pca_analysis(gt_f, 10)
+                st.session_state.mds_coords = mds_analysis(gt_f, 5)
+                st.session_state.kinship = kinship_matrix(gt_f)
+                st.session_state.ld_df = ld_decay(
+                    gt_f, snp_f["BP"].values, max_kb=1000, max_snp=1000)
+                st.session_state.fst = fst_per_snp(gt_f, ind_f["FID"].values)
+            st.success("✅ Pipeline terminé ! Consultez les onglets.")
+        except Exception as e:
+            st.error(f"❌ Erreur pipeline : {e}")
 
 
 if __name__ == "__main__":
