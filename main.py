@@ -3,7 +3,7 @@
 Pipeline complet de bioinformatique pour puces SNP bovines.
 Application Streamlit mono-fichier — déployable sur Streamlit Cloud.
 
-Version 2.1 — corrections :
+Version 2.2 — corrections :
  - Encodage 0/1/2 réel (dosage de l'allèle mineur) pour PED
  - Génération de démo alignée (gt ↔ ind_df)
  - Test exact de Hardy-Weinberg (Wigginton et al. 2005)
@@ -12,8 +12,8 @@ Version 2.1 — corrections :
  - Manhattan robuste aux chromosomes non numériques
  - Garde-fous d'alignement dans le filtrage QC
  - Séparation reset_all_derived() / invalidate_downstream()
-   → élimination du bug AttributeError sur gt=None
- - Conditions défensives (is not None and has_qc()) sur tous les onglets
+ - Conditions défensives (has_qc()) sur tous les onglets
+ - Heatmap GRM avec go.Heatmap (contourne le DuplicateError de px.imshow)
 """
 
 import warnings
@@ -43,8 +43,8 @@ st.set_page_config(
 )
 
 DEFAULT_THRESHOLDS = {
-    "geno": 0.05,     # missingness SNP
-    "mind": 0.05,     # missingness individu
+    "geno": 0.05,
+    "mind": 0.05,
     "maf": 0.05,
     "hwe": 1e-6,
     "het_sd": 3.0,
@@ -74,10 +74,7 @@ def impute_mean(gt: np.ndarray) -> np.ndarray:
 # ============================================================
 
 def parse_map(map_bytes: bytes) -> tuple:
-    """
-    Parse un fichier .map (chr, snp_id, cm, bp).
-    Retourne (DataFrame, nombre de lignes rejetées).
-    """
+    """Parse un fichier .map (chr, snp_id, cm, bp)."""
     text = map_bytes.decode("utf-8", errors="replace")
     rows, rejected = [], 0
     for line in text.splitlines():
@@ -109,12 +106,7 @@ def parse_map(map_bytes: bytes) -> tuple:
 
 
 def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
-    """
-    Parse un fichier .ped et encode les génotypes en dosage 0/1/2 de
-    l'allèle MINEUR (déterminé par comptage sur l'échantillon).
-
-    Retourne (gt, ind_df, n_rejected).
-    """
+    """Parse un fichier .ped et encode en dosage 0/1/2 de l'allèle mineur."""
     text = ped_bytes.decode("utf-8", errors="replace")
     fids, iids, geno_rows = [], [], []
     rejected = 0
@@ -139,7 +131,7 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
             f"{expected_cols} colonnes."
         )
 
-    # --- Passe 1 : comptage des allèles par SNP ---
+    # Passe 1 : comptage des allèles
     allele_counts = [Counter() for _ in range(n_snp)]
     for row in geno_rows:
         for j in range(n_snp):
@@ -150,14 +142,13 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
             c[a1] += 1
             c[a2] += 1
 
-    # Allèle mineur (None si monomorphe)
     minor = [None] * n_snp
     for j, c in enumerate(allele_counts):
         if len(c) < 2:
             continue
         minor[j] = min(c, key=c.get)
 
-    # --- Passe 2 : dosage 0/1/2 de l'allèle mineur ---
+    # Passe 2 : dosage 0/1/2
     gt = np.full((n_ind, n_snp), np.nan, dtype=np.float32)
     for i, row in enumerate(geno_rows):
         for j in range(n_snp):
@@ -179,10 +170,7 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
 
 def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
                        n_pop: int = 4, seed: int = 42) -> tuple:
-    """
-    Génère un jeu synthétique avec structure de populations (Fst modéré).
-    Le nombre d'individus par population est réparti équitablement.
-    """
+    """Génère un jeu synthétique avec structure de populations."""
     rng = np.random.default_rng(seed)
 
     pool_names = ["AND", "EBG", "ELN", "EZP", "FGN", "LJR", "NAR",
@@ -211,7 +199,6 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
             ind_rows.append({"FID": pop, "IID": f"{pop}_{i + 1:03d}"})
             k += 1
 
-    # Missingness ~2 %
     mask = rng.random(gt.shape) < 0.02
     gt[mask] = np.nan
 
@@ -273,7 +260,6 @@ def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
     probs[mid] = 1.0
     mysum = 1.0
 
-    # Récurrence vers le haut
     curr_hets = mid
     curr_homr = (rare - mid) // 2
     curr_homc = n - curr_hets - curr_homr
@@ -287,7 +273,6 @@ def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
         curr_homr -= 1
         curr_homc -= 1
 
-    # Récurrence vers le bas
     curr_hets = mid
     curr_homr = (rare - mid) // 2
     curr_homc = n - curr_hets - curr_homr
@@ -337,7 +322,6 @@ def hwe_pvalues(gt: np.ndarray) -> np.ndarray:
 # ============================================================
 
 def _align_shapes(gt, ind_df, snp_df):
-    """Garde-fou : aligne gt / ind_df / snp_df."""
     n_gt, m_gt = gt.shape
     n_ind = min(n_gt, len(ind_df))
     n_snp = min(m_gt, len(snp_df))
@@ -356,24 +340,14 @@ def _align_shapes(gt, ind_df, snp_df):
 
 def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
                      snp_df: pd.DataFrame, params: dict) -> tuple:
-    """
-    Pipeline QC séquentiel :
-      1. missingness SNP (--geno)
-      2. missingness individu (--mind)
-      3. MAF
-      4. HWE
-      5. hétérozygotie (outliers > N σ)
-    """
     gt, ind_df, snp_df = _align_shapes(gt, ind_df, snp_df)
     n0, m0 = gt.shape
 
-    # 1. Missingness SNP
     miss_snp = missingness_per_snp(gt)
     keep_snp = miss_snp <= params["geno"]
     gt = gt[:, keep_snp]
     snp_df = snp_df[keep_snp].reset_index(drop=True)
 
-    # 2. Missingness individu
     miss_ind = missingness_per_ind(gt)
     keep_ind = miss_ind <= params["mind"]
     gt = gt[keep_ind]
@@ -385,7 +359,6 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
             "Assouplissez les seuils de missingness."
         )
 
-    # 3. MAF
     m = maf(gt)
     keep_maf = np.isfinite(m) & (m >= params["maf"])
     gt = gt[:, keep_maf]
@@ -394,7 +367,6 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
     if gt.shape[1] == 0:
         raise ValueError("Tous les SNPs exclus par MAF. Réduisez --maf.")
 
-    # 4. HWE
     pv = hwe_pvalues(gt)
     keep_hwe = np.isnan(pv) | (pv >= params["hwe"])
     gt = gt[:, keep_hwe]
@@ -403,7 +375,6 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
     if gt.shape[1] == 0:
         raise ValueError("Tous les SNPs exclus par HWE. Assouplissez --hwe.")
 
-    # 5. Hétérozygotie
     het = heterozygosity(gt)
     if np.nanstd(het) > 1e-9:
         z = (het - np.nanmean(het)) / np.nanstd(het)
@@ -430,7 +401,6 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
 # ============================================================
 
 def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
-    """FST de Nei par SNP (Hs pondéré par les effectifs)."""
     pops = np.unique(pop_labels)
     if len(pops) < 2:
         return np.full(gt.shape[1], np.nan)
@@ -470,7 +440,6 @@ def pca_analysis(gt: np.ndarray, n_components: int = 10) -> tuple:
 
 
 def mds_analysis(gt: np.ndarray, n_components: int = 5) -> np.ndarray:
-    """MDS sur distance d'IBS normalisée."""
     X = impute_mean(gt)
     n = X.shape[0]
     D = np.zeros((n, n), dtype=np.float32)
@@ -490,7 +459,6 @@ def mds_analysis(gt: np.ndarray, n_components: int = 5) -> np.ndarray:
 def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
              max_kb: float = 1000, max_snp: int = 1500,
              seed: int = 42) -> pd.DataFrame:
-    """LD decay vectorisé sur un sous-échantillon de SNPs."""
     n_snp = gt.shape[1]
     if n_snp < 2:
         return pd.DataFrame(columns=["dist_kb", "r2"])
@@ -522,7 +490,6 @@ def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
 
 
 def kinship_matrix(gt: np.ndarray) -> np.ndarray:
-    """Matrice de parenté génomique (GRM)."""
     X = impute_mean(gt)
     p = np.clip(X.mean(axis=0) / 2.0, 1e-3, 1 - 1e-3)
     Z = X - 2 * p
@@ -667,13 +634,58 @@ def plot_ld_decay(ld_df, bin_kb=20):
     return fig
 
 
-def plot_kinship_heatmap(G, labels):
-    df = pd.DataFrame(G, index=labels, columns=labels)
-    fig = px.imshow(
-        df, color_continuous_scale="RdBu_r", zmin=-0.3, zmax=0.5,
-        title="Matrice de parenté (GRM)", height=650, aspect="auto",
+def plot_kinship_heatmap(G: np.ndarray, labels):
+    """
+    Heatmap GRM via go.Heatmap (contourne le DuplicateError de px.imshow
+    quand les labels FID sont répétés, et évite la surcharge narwhals).
+
+    Paramètres
+    ----------
+    G : matrice (n, n) de parenté
+    labels : liste de n identifiants (FID ou FID_IID). Les doublons sont OK :
+             l'axe reste positionnel, seul le hover affiche l'identifiant.
+    """
+    labels = [str(x) for x in labels]
+    n = len(labels)
+    # Triton de labels unique si besoin pour le hover
+    seen = {}
+    unique_labels = []
+    for lab in labels:
+        seen[lab] = seen.get(lab, 0) + 1
+        unique_labels.append(lab if seen[lab] == 1 else f"{lab}#{seen[lab]}")
+
+    # Bornes dynamiques basées sur les quantiles (évite qu'un outlier écrase
+    # la dynamique de couleur)
+    vmin = float(np.nanpercentile(G, 1))
+    vmax = float(np.nanpercentile(G, 99))
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmin == vmax:
+        vmin, vmax = -0.3, 0.5
+
+    fig = go.Figure(data=go.Heatmap(
+        z=G,
+        colorscale="RdBu",
+        zmid=0.0,
+        zmin=vmin,
+        zmax=vmax,
+        colorbar=dict(title="GRM"),
+        hovertemplate=(
+            "Ind %{customdata[0]} × Ind %{customdata[1]}"
+            "<br>Parenté = %{z:.3f}<extra></extra>"
+        ),
+        customdata=np.stack(
+            [np.repeat(unique_labels, n).reshape(n, n),
+             np.tile(unique_labels, n).reshape(n, n)],
+            axis=-1,
+        ),
+    ))
+    fig.update_layout(
+        title="Matrice de parenté (GRM)",
+        height=650,
+        xaxis=dict(title="Individus", showticklabels=False),
+        yaxis=dict(title="Individus", showticklabels=False,
+                   autorange="reversed"),
+        margin=dict(l=40, r=20, t=60, b=40),
     )
-    fig.update_layout(margin=dict(l=40, r=20, t=60, b=40))
     return fig
 
 
@@ -731,7 +743,7 @@ def build_report_html(config, stats, figures=None):
 
 <hr>
 <p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform v2.1.
+Rapport généré automatiquement par Bovine SNP Platform v2.2.
 </p>
 </body>
 </html>
@@ -758,17 +770,12 @@ def init_state():
 
 
 def invalidate_downstream():
-    """Efface uniquement les analyses aval (appelée après un QC réussi)."""
     for k in ["pca_scores", "pca_var", "mds_coords", "kinship",
               "ld_df", "fst"]:
         st.session_state[k] = None
 
 
 def reset_all_derived():
-    """
-    Efface TOUT ce qui dépend des données brutes (QC + analyses aval).
-    À appeler impérativement lors d'un (re)chargement de données.
-    """
     for k in ["gt_filt", "ind_filt", "snp_filt", "qc_stats",
               "pca_scores", "pca_var", "mds_coords", "kinship",
               "ld_df", "fst"]:
@@ -780,7 +787,6 @@ def has_data() -> bool:
 
 
 def has_qc() -> bool:
-    """Vrai si QC cohérent : gt_filt ET qc_stats présents."""
     return (st.session_state.gt_filt is not None
             and st.session_state.qc_stats is not None
             and st.session_state.ind_filt is not None
@@ -818,7 +824,7 @@ def main():
                     st.session_state.gt = gt
                     st.session_state.ind_df = ind_df
                     st.session_state.snp_df = snp_df
-                    reset_all_derived()   # <-- efface QC + aval
+                    reset_all_derived()
                 st.success(
                     f"✅ {gt.shape[0]} individus × {gt.shape[1]} SNPs "
                     f"({n_pop} populations)"
@@ -838,7 +844,7 @@ def main():
                         st.session_state.gt = gt
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
-                        reset_all_derived()   # <-- efface QC + aval
+                        reset_all_derived()
                         msg = (f"✅ {gt.shape[0]} individus × "
                                f"{gt.shape[1]} SNPs chargés")
                         if rej_map or rej_ped:
@@ -871,7 +877,7 @@ def main():
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("v2.1 — Python pur. Aucune dépendance PLINK/ADMIXTURE/SNeP.")
+        st.caption("v2.2 — Python pur. Aucune dépendance PLINK/ADMIXTURE/SNeP.")
 
     # ---------------- MAIN ----------------
     if not has_data():
@@ -930,7 +936,6 @@ def main():
             except Exception as e:
                 st.error(f"❌ Erreur QC : {e}")
 
-        # --- Condition défensive : has_qc() plutôt que qc_stats truthy ---
         if has_qc():
             s = st.session_state.qc_stats
             c1, c2, c3, c4 = st.columns(4)
@@ -1012,8 +1017,13 @@ def main():
                 )
 
             if st.session_state.kinship is not None:
+                # Utiliser FID_IID pour le hover (labels uniques)
+                id_labels = (
+                    st.session_state.ind_filt["FID"].astype(str)
+                    + "_" + st.session_state.ind_filt["IID"].astype(str)
+                ).values
                 st.plotly_chart(
-                    plot_kinship_heatmap(st.session_state.kinship, labels),
+                    plot_kinship_heatmap(st.session_state.kinship, id_labels),
                     use_container_width=True,
                 )
 
