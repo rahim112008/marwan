@@ -3,7 +3,7 @@
 Pipeline complet de bioinformatique pour puces SNP bovines.
 Application Streamlit mono-fichier — déployable sur Streamlit Cloud.
 
-Version 2.0 — corrections majeures :
+Version 2.1 — corrections :
  - Encodage 0/1/2 réel (dosage de l'allèle mineur) pour PED
  - Génération de démo alignée (gt ↔ ind_df)
  - Test exact de Hardy-Weinberg (Wigginton et al. 2005)
@@ -11,13 +11,14 @@ Version 2.0 — corrections majeures :
  - LD decay vectorisé (matrice de corrélation)
  - Manhattan robuste aux chromosomes non numériques
  - Garde-fous d'alignement dans le filtrage QC
- - Invalidation automatique des analyses en aval
+ - Séparation reset_all_derived() / invalidate_downstream()
+   → élimination du bug AttributeError sur gt=None
+ - Conditions défensives (is not None and has_qc()) sur tous les onglets
 """
 
 import warnings
 from collections import Counter
 from datetime import datetime
-from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -49,7 +50,6 @@ DEFAULT_THRESHOLDS = {
     "het_sd": 3.0,
 }
 
-# Nombre max de SNPs pour le calcul HWE exact (au-delà : approximation chi²)
 HWE_EXACT_MAX_SNP = 20_000
 
 
@@ -61,21 +61,12 @@ def impute_mean(gt: np.ndarray) -> np.ndarray:
     """Imputation par moyenne de colonne (par SNP). Retourne une copie."""
     gt2 = gt.astype(np.float32, copy=True)
     col_mean = np.nanmean(gt2, axis=0)
-    # SNP totalement manquant → moyenne 0 (deviendra informatif nul)
     col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
     nan_mask = np.isnan(gt2)
     if not nan_mask.any():
         return gt2
     gt2[nan_mask] = np.take(col_mean, np.where(nan_mask)[1])
     return gt2
-
-
-def safe_divide(a, b, fill=np.nan):
-    """Division sûre, évite les RuntimeWarning."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        r = np.true_divide(a, b)
-    r = np.where(np.isfinite(r), r, fill)
-    return r
 
 
 # ============================================================
@@ -89,7 +80,7 @@ def parse_map(map_bytes: bytes) -> tuple:
     """
     text = map_bytes.decode("utf-8", errors="replace")
     rows, rejected = [], 0
-    for i, line in enumerate(text.splitlines(), start=1):
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -159,7 +150,7 @@ def parse_ped(ped_bytes: bytes, n_snp: int) -> tuple:
             c[a1] += 1
             c[a2] += 1
 
-    # Détermination de l'allèle mineur (None si monomorphe)
+    # Allèle mineur (None si monomorphe)
     minor = [None] * n_snp
     for j, c in enumerate(allele_counts):
         if len(c) < 2:
@@ -190,8 +181,7 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
                        n_pop: int = 4, seed: int = 42) -> tuple:
     """
     Génère un jeu synthétique avec structure de populations (Fst modéré).
-    Le nombre d'individus par population est réparti équitablement, le reste
-    est distribué aux premières populations.
+    Le nombre d'individus par population est réparti équitablement.
     """
     rng = np.random.default_rng(seed)
 
@@ -200,7 +190,6 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
     n_pop = max(1, min(n_pop, len(pool_names)))
     pop_names = pool_names[:n_pop]
 
-    # Répartition : base + 1 pour les premières pops
     per_pop = n_ind // n_pop
     remainder = n_ind - per_pop * n_pop
     counts = [per_pop + (1 if i < remainder else 0) for i in range(n_pop)]
@@ -233,9 +222,10 @@ def generate_demo_data(n_ind: int = 150, n_snp: int = 800,
         "CM": 0.0,
         "BP": rng.integers(1, 100_000_000, n_snp),
     })
-    # Trier par chr puis bp (ordre réaliste)
     snp_df["_chr_int"] = pd.to_numeric(snp_df["CHR"], errors="coerce").fillna(0).astype(int)
-    snp_df = snp_df.sort_values(["_chr_int", "BP"]).drop(columns="_chr_int").reset_index(drop=True)
+    snp_df = (snp_df.sort_values(["_chr_int", "BP"])
+                    .drop(columns="_chr_int")
+                    .reset_index(drop=True))
 
     return gt, ind_df, snp_df
 
@@ -253,7 +243,6 @@ def missingness_per_snp(gt: np.ndarray) -> np.ndarray:
 
 
 def allele_freq(gt: np.ndarray) -> np.ndarray:
-    """Fréquence de l'allèle codé '1' (dosage moyen / 2)."""
     return np.nanmean(gt, axis=0) / 2.0
 
 
@@ -263,26 +252,19 @@ def maf(gt: np.ndarray) -> np.ndarray:
 
 
 def heterozygosity(gt: np.ndarray) -> np.ndarray:
-    """Hétérozygotie observée par individu (nécessite dosage 0/1/2)."""
     with np.errstate(invalid="ignore"):
         return np.nanmean(gt == 1, axis=1)
 
 
 def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
-    """
-    Test exact de Hardy-Weinberg (Wigginton, Cutler, Abecasis 2005).
-    n_hom1 et n_hom2 = comptages des deux homozygotes (ordre indifférent).
-    Retourne la p-value bilatérale. np.nan si non calculable.
-    """
+    """Test exact de Hardy-Weinberg (Wigginton, Cutler, Abecasis 2005)."""
     n = n_het + n_hom1 + n_hom2
     if n == 0:
         return np.nan
-    # Cas triviaux : monomorphe
     if n_het == 0 and (n_hom1 == 0 or n_hom2 == 0):
         return 1.0
 
     rare = 2 * min(n_hom1, n_hom2) + n_het
-    # mid : point de départ de la récursion
     mid = (rare * (2 * n - rare)) // (2 * n)
     if mid % 2 != rare % 2:
         mid += 1
@@ -319,38 +301,28 @@ def hwe_exact_p(n_het: int, n_hom1: int, n_hom2: int) -> float:
         curr_homr += 1
         curr_homc += 1
 
-    # p-value bilatérale : somme des probas ≤ proba observée
     p_obs = probs[n_het] if n_het < len(probs) else 0.0
     p_hwe = probs[probs <= p_obs + 1e-7].sum() / mysum
     return float(min(p_hwe, 1.0))
 
 
-def hwe_pvalues(gt: np.ndarray, progress_cb=None) -> np.ndarray:
-    """
-    p-values HWE par SNP. Test exact si peu de SNPs, sinon approximation
-    chi² avec correction de continuité (rapide).
-    """
+def hwe_pvalues(gt: np.ndarray) -> np.ndarray:
+    """p-values HWE par SNP (exact si peu de SNPs, sinon chi² Yates)."""
     n_ind, n_snp = gt.shape
     pvals = np.full(n_snp, np.nan, dtype=np.float64)
 
-    # Comptages vectorisés 0/1/2
     nan_mask = np.isnan(gt)
     n0 = ((gt == 0) & ~nan_mask).sum(axis=0)
     n1 = ((gt == 1) & ~nan_mask).sum(axis=0)
     n2 = ((gt == 2) & ~nan_mask).sum(axis=0)
     n_valid = n0 + n1 + n2
 
-    use_exact = n_snp <= HWE_EXACT_MAX_SNP
-
-    if use_exact:
+    if n_snp <= HWE_EXACT_MAX_SNP:
         for j in range(n_snp):
             if n_valid[j] < 5:
                 continue
             pvals[j] = hwe_exact_p(int(n1[j]), int(n0[j]), int(n2[j]))
-            if progress_cb and (j % 500 == 0):
-                progress_cb(j / n_snp)
     else:
-        # Approximation chi² avec Yates
         p = (n1 + 2 * n2) / (2.0 * np.where(n_valid > 0, n_valid, np.nan))
         with np.errstate(invalid="ignore", divide="ignore"):
             exp_het = 2.0 * p * (1.0 - p) * n_valid
@@ -365,7 +337,7 @@ def hwe_pvalues(gt: np.ndarray, progress_cb=None) -> np.ndarray:
 # ============================================================
 
 def _align_shapes(gt, ind_df, snp_df):
-    """Garde-fou : aligne gt / ind_df / snp_df sur leurs dimensions communes."""
+    """Garde-fou : aligne gt / ind_df / snp_df."""
     n_gt, m_gt = gt.shape
     n_ind = min(n_gt, len(ind_df))
     n_snp = min(m_gt, len(snp_df))
@@ -383,16 +355,14 @@ def _align_shapes(gt, ind_df, snp_df):
 
 
 def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
-                     snp_df: pd.DataFrame, params: dict,
-                     progress_cb=None) -> tuple:
+                     snp_df: pd.DataFrame, params: dict) -> tuple:
     """
     Pipeline QC séquentiel :
       1. missingness SNP (--geno)
       2. missingness individu (--mind)
       3. MAF
-      4. HWE (test exact)
+      4. HWE
       5. hétérozygotie (outliers > N σ)
-    Retourne (gt_filt, ind_filt, snp_filt, stats_dict).
     """
     gt, ind_df, snp_df = _align_shapes(gt, ind_df, snp_df)
     n0, m0 = gt.shape
@@ -425,12 +395,13 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
         raise ValueError("Tous les SNPs exclus par MAF. Réduisez --maf.")
 
     # 4. HWE
-    if progress_cb:
-        progress_cb("HWE")
     pv = hwe_pvalues(gt)
     keep_hwe = np.isnan(pv) | (pv >= params["hwe"])
     gt = gt[:, keep_hwe]
     snp_df = snp_df[keep_hwe].reset_index(drop=True)
+
+    if gt.shape[1] == 0:
+        raise ValueError("Tous les SNPs exclus par HWE. Assouplissez --hwe.")
 
     # 5. Hétérozygotie
     het = heterozygosity(gt)
@@ -441,6 +412,9 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
         keep_het = np.ones_like(het, dtype=bool)
     gt = gt[keep_het]
     ind_df = ind_df[keep_het].reset_index(drop=True)
+
+    if gt.shape[0] == 0:
+        raise ValueError("Tous les individus exclus par hétérozygotie.")
 
     stats_dict = {
         "n_ind_init": int(n0), "n_snp_init": int(m0),
@@ -456,9 +430,7 @@ def apply_qc_filters(gt: np.ndarray, ind_df: pd.DataFrame,
 # ============================================================
 
 def fst_per_snp(gt: np.ndarray, pop_labels: np.ndarray) -> np.ndarray:
-    """
-    FST de Nei par SNP (Hs pondéré par les effectifs par population).
-    """
+    """FST de Nei par SNP (Hs pondéré par les effectifs)."""
     pops = np.unique(pop_labels)
     if len(pops) < 2:
         return np.full(gt.shape[1], np.nan)
@@ -498,10 +470,9 @@ def pca_analysis(gt: np.ndarray, n_components: int = 10) -> tuple:
 
 
 def mds_analysis(gt: np.ndarray, n_components: int = 5) -> np.ndarray:
-    """MDS sur distance d'IBS normalisée (adaptée aux données génomiques)."""
+    """MDS sur distance d'IBS normalisée."""
     X = impute_mean(gt)
     n = X.shape[0]
-    # Distance de Hamming normalisée par le nombre de SNPs
     D = np.zeros((n, n), dtype=np.float32)
     for i in range(n):
         D[i] = np.abs(X - X[i]).sum(axis=1) / X.shape[1]
@@ -531,13 +502,11 @@ def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
     gt_sub = impute_mean(gt[:, idx])
     bp_sub = snp_bp[idx].astype(np.float64)
 
-    # Standardisation par SNP
     X = gt_sub - gt_sub.mean(axis=0)
     std = gt_sub.std(axis=0)
     std[std < 1e-8] = np.nan
     X = X / std
 
-    # Matrice de corrélation (SNPs × SNPs)
     n = X.shape[0]
     C = (X.T @ X) / n
     R2 = C ** 2
@@ -553,7 +522,7 @@ def ld_decay(gt: np.ndarray, snp_bp: np.ndarray,
 
 
 def kinship_matrix(gt: np.ndarray) -> np.ndarray:
-    """Matrice de parenté génomique (GRM, approche GCTA simplifiée)."""
+    """Matrice de parenté génomique (GRM)."""
     X = impute_mean(gt)
     p = np.clip(X.mean(axis=0) / 2.0, 1e-3, 1 - 1e-3)
     Z = X - 2 * p
@@ -623,7 +592,6 @@ def plot_mds(coords, labels):
 
 
 def _chr_sort_key(chrom: str):
-    """Clé de tri robuste : numériques < sexuels < autres (alphabétique)."""
     s = str(chrom).upper()
     if s.isdigit():
         return (0, int(s), "")
@@ -639,7 +607,6 @@ def plot_manhattan(fst, chr_col, threshold_q=0.999):
     if df.empty:
         return None
 
-    # Tri selon chromosomes puis ordre original (position)
     order = df["CHR"].map(lambda c: _chr_sort_key(c))
     df["_k0"] = order.map(lambda t: t[0])
     df["_k1"] = order.map(lambda t: t[1])
@@ -659,10 +626,9 @@ def plot_manhattan(fst, chr_col, threshold_q=0.999):
 
     df["x"] = cum_positions
     fig = go.Figure()
-    for chrom in df["CHR"].unique():
+    unique_chrs = list(df["CHR"].unique())
+    for idx_chr, chrom in enumerate(unique_chrs):
         sub = df[df["CHR"] == chrom]
-        # Alternance par index pair/impair du chromosome
-        idx_chr = list(df["CHR"].unique()).index(chrom)
         color = "#2c3e50" if idx_chr % 2 == 0 else "#7f8c8d"
         fig.add_trace(go.Scatter(
             x=sub["x"], y=sub["FST"], mode="markers",
@@ -765,7 +731,7 @@ def build_report_html(config, stats, figures=None):
 
 <hr>
 <p style="font-size:0.85em; color:#666">
-Rapport généré automatiquement par Bovine SNP Platform v2.0.
+Rapport généré automatiquement par Bovine SNP Platform v2.1.
 </p>
 </body>
 </html>
@@ -792,8 +758,19 @@ def init_state():
 
 
 def invalidate_downstream():
-    """À appeler après (re)exécution du QC."""
+    """Efface uniquement les analyses aval (appelée après un QC réussi)."""
     for k in ["pca_scores", "pca_var", "mds_coords", "kinship",
+              "ld_df", "fst"]:
+        st.session_state[k] = None
+
+
+def reset_all_derived():
+    """
+    Efface TOUT ce qui dépend des données brutes (QC + analyses aval).
+    À appeler impérativement lors d'un (re)chargement de données.
+    """
+    for k in ["gt_filt", "ind_filt", "snp_filt", "qc_stats",
+              "pca_scores", "pca_var", "mds_coords", "kinship",
               "ld_df", "fst"]:
         st.session_state[k] = None
 
@@ -803,7 +780,11 @@ def has_data() -> bool:
 
 
 def has_qc() -> bool:
-    return st.session_state.gt_filt is not None
+    """Vrai si QC cohérent : gt_filt ET qc_stats présents."""
+    return (st.session_state.gt_filt is not None
+            and st.session_state.qc_stats is not None
+            and st.session_state.ind_filt is not None
+            and st.session_state.snp_filt is not None)
 
 
 # ============================================================
@@ -837,8 +818,7 @@ def main():
                     st.session_state.gt = gt
                     st.session_state.ind_df = ind_df
                     st.session_state.snp_df = snp_df
-                    st.session_state.gt_filt = None
-                    invalidate_downstream()
+                    reset_all_derived()   # <-- efface QC + aval
                 st.success(
                     f"✅ {gt.shape[0]} individus × {gt.shape[1]} SNPs "
                     f"({n_pop} populations)"
@@ -858,8 +838,7 @@ def main():
                         st.session_state.gt = gt
                         st.session_state.ind_df = ind_df
                         st.session_state.snp_df = map_df
-                        st.session_state.gt_filt = None
-                        invalidate_downstream()
+                        reset_all_derived()   # <-- efface QC + aval
                         msg = (f"✅ {gt.shape[0]} individus × "
                                f"{gt.shape[1]} SNPs chargés")
                         if rej_map or rej_ped:
@@ -892,7 +871,7 @@ def main():
                 st.session_state.run_requested = True
 
         st.divider()
-        st.caption("v2.0 — Python pur. Aucune dépendance PLINK/ADMIXTURE/SNeP.")
+        st.caption("v2.1 — Python pur. Aucune dépendance PLINK/ADMIXTURE/SNeP.")
 
     # ---------------- MAIN ----------------
     if not has_data():
@@ -951,7 +930,8 @@ def main():
             except Exception as e:
                 st.error(f"❌ Erreur QC : {e}")
 
-        if st.session_state.qc_stats:
+        # --- Condition défensive : has_qc() plutôt que qc_stats truthy ---
+        if has_qc():
             s = st.session_state.qc_stats
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Individus finaux", s["n_ind_final"],
@@ -1016,23 +996,22 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Erreur : {e}")
 
-            labels = (st.session_state.ind_filt["FID"].values
-                      if has_qc() else None)
+            labels = st.session_state.ind_filt["FID"].values
 
-            if st.session_state.pca_scores is not None and labels is not None:
+            if st.session_state.pca_scores is not None:
                 st.plotly_chart(
                     plot_pca(st.session_state.pca_scores,
                              st.session_state.pca_var, labels),
                     use_container_width=True,
                 )
 
-            if st.session_state.mds_coords is not None and labels is not None:
+            if st.session_state.mds_coords is not None:
                 st.plotly_chart(
                     plot_mds(st.session_state.mds_coords, labels),
                     use_container_width=True,
                 )
 
-            if st.session_state.kinship is not None and labels is not None:
+            if st.session_state.kinship is not None:
                 st.plotly_chart(
                     plot_kinship_heatmap(st.session_state.kinship, labels),
                     use_container_width=True,
@@ -1123,7 +1102,7 @@ def main():
     # ---------- TAB 6 : Rapport ----------
     with tabs[5]:
         st.subheader("Génération du rapport")
-        if st.session_state.qc_stats is None:
+        if not has_qc():
             st.warning("⚠️ Lancez au moins le QC pour générer un rapport.")
         else:
             project_name = st.text_input("Nom du projet", "Cattle_Project")
